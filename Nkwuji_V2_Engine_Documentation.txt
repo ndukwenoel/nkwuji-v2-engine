@@ -1,0 +1,60 @@
+====================================================
+NKWUJI V2 TRADING ENGINE - TECHNICAL DOCUMENTATION
+====================================================
+
+1. CORE ARCHITECTURE
+The Nkwuji V2 engine is a purely Python-driven algorithmic trading system built exclusively for the MetaTrader 5 (MT5) platform. 
+It operates via a continuous 1-second interval loop (TICK_INTERVAL_SEC), constantly checking account health, actively managing open positions, and hunting for new entry signals across a specified list of target assets (e.g., AUDUSD, EURJPY, XAUUSD).
+
+2. MARKET ANALYSIS & SIGNAL GENERATION
+The engine evaluates the market on the 5-minute (M5) timeframe. For a valid trade signal to be generated, four specific technical conditions must align perfectly on a newly closed candle to prevent false entries and lookahead bias:
+
+A. Keltner Channels (Agimat Touch)
+The engine calculates a 20-period Exponential Moving Average (EMA) and wraps it in a Keltner Channel (KC) using a 2.0 multiplier of the Average True Range (ATR). 
+- BUY Condition: Price must dip and touch/pierce the lower KC band.
+- SELL Condition: Price must spike and touch/pierce the upper KC band.
+
+B. Fractals (Swing Confirmation)
+The system looks for localized structural swing points across a rolling 5-candle window. It waits 2 candles after the swing to mathematically confirm that the swing point holds.
+- BUY Condition: A confirmed Swing Low (Dot) is present.
+- SELL Condition: A confirmed Swing High (Dot) is present.
+
+C. Momentum Check
+The system requires that the immediate price action (the candle closing right before the signal triggers) respects the direction of the trade to ensure momentum is on our side.
+- BUY Condition: The previous candle must have closed bullish (Close > Open).
+- SELL Condition: The previous candle must have closed bearish (Close < Open).
+
+D. Linear Regression Trend Channel (Macro Trend Filter)
+To ensure the trade is taken within the context of the broader trend, it calculates a 100-candle linear regression channel.
+- BUY Condition: Price must be touching or piercing the floor (lower band) of this macro channel.
+- SELL Condition: Price must be touching or piercing the ceiling (upper band) of this macro channel.
+
+*Take Profit (TP) & Stop Loss (SL):* 
+Once a valid signal is detected, the Engine uses the ATR (Average True Range, 14-period) to set dynamic boundaries based on current market volatility.
+SL = 1.5x ATR
+TP = 2.0x ATR
+
+3. RISK MANAGEMENT
+Before a trade is dispatched to the broker, it passes through the RiskManager:
+- Account Drawdown Shield: If the account equity falls by 15% below the initial starting balance, the engine goes into "Management Only" mode and refuses to open new trades.
+- Dynamic Position Sizing: The lot size is dynamically calculated so that if the SL is hit, the account will only lose exactly 2.5% of its current equity. (If the resulting lot size is smaller than the broker's minimum allowable lot, the engine will force the minimum lot and log a warning).
+- Margin Level Eject: If the account's Margin Level drops below 65%, the engine triggers an Emergency Close, immediately terminating all open trades to prevent a broker margin call.
+- Spread Filter: Trades on standard forex pairs will be outright rejected if the current spread exceeds 4.0 pips to protect against severe slippage during news/rollover.
+
+4. ADVANCED TRADE MANAGEMENT
+Once a trade is live on MT5, the ExecutionManager constantly monitors its journey toward the Take Profit. It has multiple defensive mechanisms:
+
+A. 50% Mid-Point Scale-Out
+When the trade reaches 50% of the distance to the TP, the engine automatically closes half (50%) of the position size to lock in guaranteed cash while letting the rest run.
+
+B. 85% Early Take Profit (Spread Defense)
+To prevent the notorious issue where the price wick visually touches the TP but the trade is not closed due to the Bid/Ask spread, the engine will forcibly close the ENTIRE remaining position the second it reaches 85% of the total distance to the TP.
+
+C. 90% Near-Miss Flag & Retrace Offload
+(This acts as a safety net if Early TP is disabled). If a trade reaches 90% of its TP and then reverses, the engine arms a "Retrace Lock". If the price falls back down to the 80% mark, it will execute a market close to dump the position before it can turn into a loss.
+
+D. Fail-Safe Exit (Dot Breach)
+If a trade goes immediately wrong and the price crosses the exact price of the original Swing Fractal (the "Dot"), the engine calculates the pip loss. If it exceeds 10 pips, it immediately pulls the plug on the trade rather than waiting for the physical Stop Loss to be hit.
+
+E. Maximum Hold Time
+If a trade has been open and floating for 6 hours straight without hitting TP or SL, the engine executes a Time Close, killing the trade to free up capital and avoid stagnation.
