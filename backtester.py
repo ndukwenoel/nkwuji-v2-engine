@@ -56,51 +56,77 @@ class Backtester:
         return upper_channel, lower_channel
 
     def connect(self):
-        logger.info("Initializing MT5...")
-        if MT5_TERMINAL_PATH:
-            mt5.initialize(path=MT5_TERMINAL_PATH)
-        else:
-            mt5.initialize()
-            
-        authorized = mt5.login(MT5_ACCOUNT, password=MT5_PASSWORD, server=MT5_SERVER)
-        if not authorized:
-            logger.error("Failed to connect to MT5.")
+        logger.info("Initializing MT5... (Relying on active desktop session)")
+        if not mt5.initialize():
+            logger.error("Failed to connect to MT5. Ensure the terminal is open.")
             return False
         return True
 
     def fetch_data(self):
-        logger.info(f"Fetching M5 data for {self.pair} from {self.start_date.date()} to {self.end_date.date()}...")
+        import os
+        logger.info(f"Fetching data for {self.pair} from {self.start_date.date()} to {self.end_date.date()}...")
         utc_from = self.start_date.replace(tzinfo=datetime.timezone.utc)
         utc_to = self.end_date.replace(tzinfo=datetime.timezone.utc)
         
-        rates = mt5.copy_rates_range(self.pair, mt5.TIMEFRAME_M5, utc_from, utc_to)
-        if rates is None or len(rates) == 0:
-            logger.error("Failed to fetch data.")
-            return False
+        cache_dir = "data"
+        os.makedirs(cache_dir, exist_ok=True)
+        m5_cache_path = os.path.join(cache_dir, f"{self.pair}_M5.csv")
+        m1_cache_path = os.path.join(cache_dir, f"{self.pair}_M1.csv")
+
+        # Fetch M5
+        if os.path.exists(m5_cache_path):
+            self.df = pd.read_csv(m5_cache_path)
+            self.df['time'] = pd.to_datetime(self.df['time'])
+            logger.info("Loaded M5 from cache.")
+        else:
+            rates = mt5.copy_rates_range(self.pair, mt5.TIMEFRAME_M5, utc_from, utc_to)
+            if rates is None or len(rates) == 0:
+                logger.error("Failed to fetch M5 data.")
+                return False
+            self.df = pd.DataFrame(rates)
+            self.df['time'] = pd.to_datetime(self.df['time'], unit='s')
             
-        self.df = pd.DataFrame(rates)
-        self.df['time'] = pd.to_datetime(self.df['time'], unit='s')
+            # Calculate Indicators (Vectorized)
+            self.df['ema'] = self.df['close'].ewm(span=KC_PERIOD, adjust=False).mean()
+            self.df['atr'] = self._calculate_atr(self.df, ATR_PERIOD)
+            self.df['kc_upper'] = self.df['ema'] + (KC_MULT * self.df['atr'])
+            self.df['kc_lower'] = self.df['ema'] - (KC_MULT * self.df['atr'])
+            
+            # Linear Regression Trend Channel
+            self.df['tc_upper'], self.df['tc_lower'] = self._calculate_trend_channel(self.df, TREND_CHANNEL_LOOKBACK)
+            
+            # Fractals
+            self.df['local_high'] = self.df['high'].rolling(window=5).max()
+            self.df['local_low'] = self.df['low'].rolling(window=5).min()
+            self.df['is_swing_high'] = self.df['high'] == self.df['local_high'].shift(-2)
+            self.df['is_swing_low'] = self.df['low'] == self.df['local_low'].shift(-2)
+            
+            self.df.to_csv(m5_cache_path, index=False)
+            logger.info("Saved M5 to cache.")
+
+        # Fetch M1
+        if os.path.exists(m1_cache_path):
+            self.df_m1 = pd.read_csv(m1_cache_path)
+            self.df_m1['time'] = pd.to_datetime(self.df_m1['time'])
+            logger.info("Loaded M1 from cache.")
+        else:
+            rates_m1 = mt5.copy_rates_range(self.pair, mt5.TIMEFRAME_M1, utc_from, utc_to)
+            if rates_m1 is None or len(rates_m1) == 0:
+                logger.error("Failed to fetch M1 data.")
+                return False
+            self.df_m1 = pd.DataFrame(rates_m1)
+            self.df_m1['time'] = pd.to_datetime(self.df_m1['time'], unit='s')
+            self.df_m1.to_csv(m1_cache_path, index=False)
+            logger.info("Saved M1 to cache.")
+            
+        # Index by time for fast lookups
+        self.df_m1.set_index('time', inplace=True)
         
-        # Calculate Indicators (Vectorized)
-        self.df['ema'] = self.df['close'].ewm(span=KC_PERIOD, adjust=False).mean()
-        self.df['atr'] = self._calculate_atr(self.df, ATR_PERIOD)
-        self.df['kc_upper'] = self.df['ema'] + (KC_MULT * self.df['atr'])
-        self.df['kc_lower'] = self.df['ema'] - (KC_MULT * self.df['atr'])
-        
-        # Linear Regression Trend Channel
-        self.df['tc_upper'], self.df['tc_lower'] = self._calculate_trend_channel(self.df, TREND_CHANNEL_LOOKBACK)
-        
-        # Fractals
-        self.df['local_high'] = self.df['high'].rolling(window=5).max()
-        self.df['local_low'] = self.df['low'].rolling(window=5).min()
-        self.df['is_swing_high'] = self.df['high'] == self.df['local_high'].shift(-2)
-        self.df['is_swing_low'] = self.df['low'] == self.df['local_low'].shift(-2)
-        
-        logger.info(f"Prepared {len(self.df)} candles for simulation.")
+        logger.info(f"Prepared {len(self.df)} M5 candles and {len(self.df_m1)} M1 candles for simulation.")
         return True
 
     def run(self):
-        if self.df.empty:
+        if self.df.empty or not hasattr(self, 'df_m1') or self.df_m1.empty:
             return
             
         symbol_info = mt5.symbol_info(self.pair)
@@ -108,127 +134,137 @@ class Backtester:
             logger.error(f"Symbol {self.pair} not found.")
             return
             
-        logger.info("Starting simulation loop with PESSIMISTIC execution...")
-        open_trade = None
+        logger.info("Starting simulation loop with M1-ACCURACY execution...")
         
-        for i in range(10, len(self.df)):
+        i = 10
+        while i < len(self.df):
             current_candle = self.df.iloc[i]
             
-            # --- MANAGE OPEN TRADE ---
-            if open_trade is not None:
-                high = current_candle['high']
-                low = current_candle['low']
-                close = current_candle['close']
-                
-                # --- PESSIMISTIC EXECUTION LOGIC ---
-                # We assume the worst-case scenario: If a candle touches the SL, we assume it hit the SL FIRST before hitting any TP or Profit Lock.
-                
-                sl_hit = False
-                tp_hit = False
-                
-                if open_trade['direction'] == 'LONG':
-                    if low <= open_trade['sl']: sl_hit = True
-                    if high >= open_trade['tp']: tp_hit = True
-                else: # SHORT
-                    if high >= open_trade['sl']: sl_hit = True
-                    if low <= open_trade['tp']: tp_hit = True
-                    
-                # Always process Stop Loss FIRST in pessimistic mode
-                if sl_hit:
-                    self._close_trade(open_trade, open_trade['sl'], current_candle['time'], "SL Hit (Pessimistic)")
-                    open_trade = None
-                    continue
-                    
-                if tp_hit:
-                    self._close_trade(open_trade, open_trade['tp'], current_candle['time'], "TP Hit")
-                    open_trade = None
-                    continue
-                        
-                # Check V2 Early TP
-                total_dist = abs(open_trade['tp'] - open_trade['open_price'])
-                current_dist = abs(high - open_trade['open_price']) if open_trade['direction'] == 'LONG' else abs(open_trade['open_price'] - low)
-                if total_dist > 0:
-                    journey_pct = current_dist / total_dist
-                    if EARLY_TP_ENABLED and journey_pct >= EARLY_TP_PERCENT:
-                        self._close_trade(open_trade, high if open_trade['direction'] == 'LONG' else low, current_candle['time'], "V2 Early TP (85%)")
-                        open_trade = None
-                        continue
-                        
-                # Check Option B Profit Lock (Pessimistic)
-                if TRADE_MODE == "MODE_LOCK_PROFIT":
-                    if open_trade['direction'] == 'LONG':
-                        max_price = high
-                        min_price = low
-                    else:
-                        max_price = low
-                        min_price = high
-                        
-                    # Calculate worst-case profit first
-                    profit_at_min = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if open_trade['direction'] == 'LONG' else mt5.ORDER_TYPE_SELL, 
-                                                          self.pair, self.volume, open_trade['open_price'], min_price)
-                                                          
-                    # If the worst-case price in this candle would have stopped us out at our CURRENT locked profit, we close it immediately.
-                    if open_trade['locked_profit'] > 0.0 and profit_at_min is not None and profit_at_min <= open_trade['locked_profit']:
-                        self._close_trade(open_trade, close, current_candle['time'], f"Lock ${open_trade['locked_profit']} Hit", forced_profit=open_trade['locked_profit'])
-                        open_trade = None
-                        continue
-                        
-                    # Only if we SURVIVED the worst-case price drop do we allow the algorithm to check if we hit a new high to lock in MORE profit.
-                    profit_at_max = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if open_trade['direction'] == 'LONG' else mt5.ORDER_TYPE_SELL, 
-                                                          self.pair, self.volume, open_trade['open_price'], max_price)
-                                                          
-                    for trigger_usd, lock_usd in reversed(PROFIT_LOCK_TIERS):
-                        if profit_at_max is not None and profit_at_max >= trigger_usd:
-                            if lock_usd > open_trade['locked_profit']:
-                                open_trade['locked_profit'] = lock_usd
-                            break
-
             # --- CHECK FOR NEW SIGNALS ---
-            if open_trade is None:
-                # Signal logic evaluates candles matching the live bot's delay (c3 is the signal candle)
-                c1 = self.df.iloc[i-1] 
-                c3 = self.df.iloc[i-3]
+            c1 = self.df.iloc[i-1] 
+            c3 = self.df.iloc[i-3]
+            open_trade = None
+            
+            # Buy Signal
+            kc_lower_touch = c3['low'] <= c3['kc_lower']
+            swing_low_present = self.df['is_swing_low'].iloc[i-3]
+            buy_momentum = c1['close'] > c1['open']
+            tc_lower_touch = (c3['low'] <= c3['tc_lower']) or (self.df.iloc[i-4]['low'] <= self.df.iloc[i-4]['tc_lower'])
+            
+            if kc_lower_touch and swing_low_present and buy_momentum and tc_lower_touch:
+                open_price = current_candle['open']
+                sl = open_price - (c1['atr'] * ATR_SL_MULT)
+                tp = open_price + (c1['atr'] * ATR_TP_MULT)
                 
-                # Buy Signal
-                kc_lower_touch = c3['low'] <= c3['kc_lower']
-                swing_low_present = self.df['is_swing_low'].iloc[i-3]
-                buy_momentum = c1['close'] > c1['open']
-                tc_lower_touch = (c3['low'] <= c3['tc_lower']) or (self.df.iloc[i-4]['low'] <= self.df.iloc[i-4]['tc_lower'])
+                open_trade = {
+                    'direction': 'LONG',
+                    'open_price': open_price,
+                    'open_time': current_candle['time'],
+                    'sl': sl,
+                    'tp': tp,
+                    'locked_profit': 0.0
+                }
                 
-                if kc_lower_touch and swing_low_present and buy_momentum and tc_lower_touch:
-                    open_price = current_candle['open'] # Enter at open of current candle
-                    sl = open_price - (c1['atr'] * ATR_SL_MULT)
-                    tp = open_price + (c1['atr'] * ATR_TP_MULT)
-                    
-                    open_trade = {
-                        'direction': 'LONG',
-                        'open_price': open_price,
-                        'open_time': current_candle['time'],
-                        'sl': sl,
-                        'tp': tp,
-                        'locked_profit': 0.0
-                    }
-                    continue
-                    
-                # Sell Signal
-                kc_upper_touch = c3['high'] >= c3['kc_upper']
-                swing_high_present = self.df['is_swing_high'].iloc[i-3]
-                sell_momentum = c1['close'] < c1['open']
-                tc_upper_touch = (c3['high'] >= c3['tc_upper']) or (self.df.iloc[i-4]['high'] >= self.df.iloc[i-4]['tc_upper'])
+            # Sell Signal
+            kc_upper_touch = c3['high'] >= c3['kc_upper']
+            swing_high_present = self.df['is_swing_high'].iloc[i-3]
+            sell_momentum = c1['close'] < c1['open']
+            tc_upper_touch = (c3['high'] >= c3['tc_upper']) or (self.df.iloc[i-4]['high'] >= self.df.iloc[i-4]['tc_upper'])
+            
+            if open_trade is None and kc_upper_touch and swing_high_present and sell_momentum and tc_upper_touch:
+                open_price = current_candle['open']
+                sl = open_price + (c1['atr'] * ATR_SL_MULT)
+                tp = open_price - (c1['atr'] * ATR_TP_MULT)
                 
-                if kc_upper_touch and swing_high_present and sell_momentum and tc_upper_touch:
-                    open_price = current_candle['open']
-                    sl = open_price + (c1['atr'] * ATR_SL_MULT)
-                    tp = open_price - (c1['atr'] * ATR_TP_MULT)
+                open_trade = {
+                    'direction': 'SHORT',
+                    'open_price': open_price,
+                    'open_time': current_candle['time'],
+                    'sl': sl,
+                    'tp': tp,
+                    'locked_profit': 0.0
+                }
+
+            # --- MANAGE TRADE ON M1 DATA ---
+            if open_trade is not None:
+                # Get all M1 candles from the open time onwards
+                m1_future = self.df_m1.loc[open_trade['open_time']:]
+                
+                trade_closed = False
+                for m1_time, m1_candle in m1_future.iterrows():
+                    high = m1_candle['high']
+                    low = m1_candle['low']
+                    close = m1_candle['close']
                     
-                    open_trade = {
-                        'direction': 'SHORT',
-                        'open_price': open_price,
-                        'open_time': current_candle['time'],
-                        'sl': sl,
-                        'tp': tp,
-                        'locked_profit': 0.0
-                    }
+                    sl_hit = False
+                    tp_hit = False
+                    
+                    if open_trade['direction'] == 'LONG':
+                        if low <= open_trade['sl']: sl_hit = True
+                        if high >= open_trade['tp']: tp_hit = True
+                    else: # SHORT
+                        if high >= open_trade['sl']: sl_hit = True
+                        if low <= open_trade['tp']: tp_hit = True
+                        
+                    # Prioritize SL if both hit in the same minute (ultra-pessimistic within 1 minute)
+                    if sl_hit:
+                        self._close_trade(open_trade, open_trade['sl'], m1_time, "SL Hit")
+                        trade_closed = True
+                        break
+                        
+                    if tp_hit:
+                        self._close_trade(open_trade, open_trade['tp'], m1_time, "TP Hit")
+                        trade_closed = True
+                        break
+                        
+                    # Check V2 Early TP
+                    total_dist = abs(open_trade['tp'] - open_trade['open_price'])
+                    current_dist = abs(high - open_trade['open_price']) if open_trade['direction'] == 'LONG' else abs(open_trade['open_price'] - low)
+                    if total_dist > 0:
+                        journey_pct = current_dist / total_dist
+                        if EARLY_TP_ENABLED and journey_pct >= EARLY_TP_PERCENT:
+                            self._close_trade(open_trade, high if open_trade['direction'] == 'LONG' else low, m1_time, "V2 Early TP (85%)")
+                            trade_closed = True
+                            break
+                            
+                    # Check Option B Profit Lock
+                    if TRADE_MODE == "MODE_LOCK_PROFIT":
+                        if open_trade['direction'] == 'LONG':
+                            max_price = high
+                            min_price = low
+                        else:
+                            max_price = low
+                            min_price = high
+                            
+                        # If price drops to lock first
+                        profit_at_min = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if open_trade['direction'] == 'LONG' else mt5.ORDER_TYPE_SELL, 
+                                                              self.pair, self.volume, open_trade['open_price'], min_price)
+                                                              
+                        if open_trade['locked_profit'] > 0.0 and profit_at_min is not None and profit_at_min <= open_trade['locked_profit']:
+                            self._close_trade(open_trade, close, m1_time, f"Lock ${open_trade['locked_profit']} Hit", forced_profit=open_trade['locked_profit'])
+                            trade_closed = True
+                            break
+                            
+                        # Otherwise, check if we hit a new high
+                        profit_at_max = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if open_trade['direction'] == 'LONG' else mt5.ORDER_TYPE_SELL, 
+                                                              self.pair, self.volume, open_trade['open_price'], max_price)
+                                                              
+                        for trigger_usd, lock_usd in reversed(PROFIT_LOCK_TIERS):
+                            if profit_at_max is not None and profit_at_max >= trigger_usd:
+                                if lock_usd > open_trade['locked_profit']:
+                                    open_trade['locked_profit'] = lock_usd
+                                break
+                                
+                if trade_closed:
+                    # Advance M5 outer loop `i` to the M5 candle that corresponds to the close_time
+                    last_trade = self.trades[-1]
+                    close_t = last_trade['close_time']
+                    # Find the next M5 candle AFTER close_t
+                    while i < len(self.df) and self.df.iloc[i]['time'] <= close_t:
+                        i += 1
+                    continue # Start evaluating at the new `i`
+            
+            i += 1 # No trade opened, advance normally
 
     def _close_trade(self, trade, close_price, close_time, reason, forced_profit=None):
         if forced_profit is not None:

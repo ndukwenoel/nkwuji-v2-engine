@@ -36,3 +36,7 @@ share/python-wheels/
 
 # Logs
 *.log
+
+data/
+*.csv
+*.parquet
