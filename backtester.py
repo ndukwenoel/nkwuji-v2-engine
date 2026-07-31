@@ -108,7 +108,7 @@ class Backtester:
             logger.error(f"Symbol {self.pair} not found.")
             return
             
-        logger.info("Starting simulation loop...")
+        logger.info("Starting simulation loop with PESSIMISTIC execution...")
         open_trade = None
         
         for i in range(10, len(self.df)):
@@ -120,25 +120,29 @@ class Backtester:
                 low = current_candle['low']
                 close = current_candle['close']
                 
-                # Check standard SL/TP
+                # --- PESSIMISTIC EXECUTION LOGIC ---
+                # We assume the worst-case scenario: If a candle touches the SL, we assume it hit the SL FIRST before hitting any TP or Profit Lock.
+                
+                sl_hit = False
+                tp_hit = False
+                
                 if open_trade['direction'] == 'LONG':
-                    if low <= open_trade['sl']:
-                        self._close_trade(open_trade, open_trade['sl'], current_candle['time'], "SL Hit")
-                        open_trade = None
-                        continue
-                    elif high >= open_trade['tp']:
-                        self._close_trade(open_trade, open_trade['tp'], current_candle['time'], "TP Hit")
-                        open_trade = None
-                        continue
+                    if low <= open_trade['sl']: sl_hit = True
+                    if high >= open_trade['tp']: tp_hit = True
                 else: # SHORT
-                    if high >= open_trade['sl']:
-                        self._close_trade(open_trade, open_trade['sl'], current_candle['time'], "SL Hit")
-                        open_trade = None
-                        continue
-                    elif low <= open_trade['tp']:
-                        self._close_trade(open_trade, open_trade['tp'], current_candle['time'], "TP Hit")
-                        open_trade = None
-                        continue
+                    if high >= open_trade['sl']: sl_hit = True
+                    if low <= open_trade['tp']: tp_hit = True
+                    
+                # Always process Stop Loss FIRST in pessimistic mode
+                if sl_hit:
+                    self._close_trade(open_trade, open_trade['sl'], current_candle['time'], "SL Hit (Pessimistic)")
+                    open_trade = None
+                    continue
+                    
+                if tp_hit:
+                    self._close_trade(open_trade, open_trade['tp'], current_candle['time'], "TP Hit")
+                    open_trade = None
+                    continue
                         
                 # Check V2 Early TP
                 total_dist = abs(open_trade['tp'] - open_trade['open_price'])
@@ -150,36 +154,34 @@ class Backtester:
                         open_trade = None
                         continue
                         
-                # Check Option B Profit Lock
+                # Check Option B Profit Lock (Pessimistic)
                 if TRADE_MODE == "MODE_LOCK_PROFIT":
-                    # Estimate floating profit at high/low extremum
                     if open_trade['direction'] == 'LONG':
                         max_price = high
                         min_price = low
                     else:
-                        max_price = low # For short, lowest price is highest profit
+                        max_price = low
                         min_price = high
                         
-                    # Calculate max possible profit in this candle
+                    # Calculate worst-case profit first
+                    profit_at_min = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if open_trade['direction'] == 'LONG' else mt5.ORDER_TYPE_SELL, 
+                                                          self.pair, self.volume, open_trade['open_price'], min_price)
+                                                          
+                    # If the worst-case price in this candle would have stopped us out at our CURRENT locked profit, we close it immediately.
+                    if open_trade['locked_profit'] > 0.0 and profit_at_min is not None and profit_at_min <= open_trade['locked_profit']:
+                        self._close_trade(open_trade, close, current_candle['time'], f"Lock ${open_trade['locked_profit']} Hit", forced_profit=open_trade['locked_profit'])
+                        open_trade = None
+                        continue
+                        
+                    # Only if we SURVIVED the worst-case price drop do we allow the algorithm to check if we hit a new high to lock in MORE profit.
                     profit_at_max = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if open_trade['direction'] == 'LONG' else mt5.ORDER_TYPE_SELL, 
                                                           self.pair, self.volume, open_trade['open_price'], max_price)
                                                           
-                    # Check if max profit triggered a new lock
                     for trigger_usd, lock_usd in reversed(PROFIT_LOCK_TIERS):
                         if profit_at_max is not None and profit_at_max >= trigger_usd:
                             if lock_usd > open_trade['locked_profit']:
                                 open_trade['locked_profit'] = lock_usd
                             break
-                            
-                    # Calculate profit at worst price in this candle
-                    profit_at_min = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if open_trade['direction'] == 'LONG' else mt5.ORDER_TYPE_SELL, 
-                                                          self.pair, self.volume, open_trade['open_price'], min_price)
-                                                          
-                    # If profit dipped below the locked amount, we get stopped out at the locked amount
-                    if open_trade['locked_profit'] > 0.0 and profit_at_min is not None and profit_at_min <= open_trade['locked_profit']:
-                        self._close_trade(open_trade, close, current_candle['time'], f"Lock ${open_trade['locked_profit']}", forced_profit=open_trade['locked_profit'])
-                        open_trade = None
-                        continue
 
             # --- CHECK FOR NEW SIGNALS ---
             if open_trade is None:
